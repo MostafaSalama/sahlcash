@@ -1,36 +1,80 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# SahlCash
 
-## Getting Started
+Web app for retail shops to run **shifts**, track **wallets** (cash, POS, e-wallets, etc.), record **transactions** with **fees**, handle **petty cash / expenses**, **wallet recharges**, and **end-of-day reconciliation**. Built for **offline-first** queuing with IndexedDB sync when back online.
 
-First, run the development server:
+## Stack
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+- **Next.js** (App Router), **React**, **TypeScript**, **Tailwind CSS**
+- **Firebase**: Auth, Firestore, Storage
+- **next-intl**: English + Arabic (`localePrefix: always` → routes like `/en/dashboard`, `/ar/shift`)
+- **Dexie** for pending writes offline
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Prerequisites
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- Node.js **20+** (LTS recommended for tooling compatibility)
+- A **Firebase** project with Authentication, Firestore, and Storage enabled
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Setup
 
-## Learn More
+1. Clone the repo and install dependencies:
 
-To learn more about Next.js, take a look at the following resources:
+   ```bash
+   npm install
+   ```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+2. Copy environment variables and fill in values from the Firebase console (Project settings → Your apps → Web app):
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+   ```bash
+   cp .env.example .env.local
+   ```
 
-## Deploy on Vercel
+   Required `NEXT_PUBLIC_*` keys are listed in `.env.example`.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+3. Link the Firebase CLI to your project (once per machine) and deploy security rules + indexes:
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+   ```bash
+   npx firebase-tools login
+   # Create .firebaserc with your project id, or: firebase use --add
+   npm run deploy:firebase
+   npx firebase-tools deploy --only storage
+   ```
+
+   `npm run deploy:firebase` publishes **Firestore rules** and **indexes** (`firebase.json`). Deploy **Storage rules** with the command above (or add `storage` to the same deploy if you prefer one step).
+
+4. In Firebase **Authentication** → **Settings** → **Authorized domains**, add your local and production hosts (e.g. `localhost`, `your-app.vercel.app`).
+
+## Scripts
+
+| Command | Description |
+|--------|-------------|
+| `npm run dev` | Dev server (Turbopack); open [http://localhost:3000](http://localhost:3000) — middleware sends you to `/en` or `/ar` |
+| `npm run build` | Production build |
+| `npm start` | Serve production build locally |
+| `npm run lint` | ESLint |
+| `npm run deploy:firebase` | Deploy Firestore rules + indexes via Firebase CLI |
+
+## Deploy (production)
+
+- **App**: Connect the repo to [Vercel](https://vercel.com) (or any Next.js host) and set the same `NEXT_PUBLIC_*` variables in the project settings.
+- **Backend**: After changing `firestore.rules`, `firestore.indexes.json`, or `storage.rules`, redeploy with Firebase CLI as above.
+
+## Project layout (high level)
+
+- `app/[locale]/` — Pages (dashboard, shift workspace, wallets, reconciliation, analytics, auth, …)
+- `components/` — UI (including `shift/shift-workspace.tsx`)
+- `contexts/auth-context.tsx` — Store membership and Firebase auth
+- `lib/firebase/` — Client SDK helpers, balance batches, seed data
+- `lib/offline/` — IndexedDB sync for pending writes
+- `types/firestore.ts` — Firestore document shapes
+- `messages/en.json`, `messages/ar.json` — UI strings
+
+Product scope and intent are summarized in `PRD.md`.
+
+## Roles
+
+- **Admin**: wallets, team, settings, reconciliation, analytics
+- **Cashier**: shift operations, history (per your rules / gates in the app)
+
+## License
+
+Private / use per your organization’s terms.

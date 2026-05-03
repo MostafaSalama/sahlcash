@@ -7,7 +7,7 @@
     "build": "next build --turbopack",
     "start": "next start",
     "lint": "eslint",
-    "deploy:firebase": "npx --yes firebase-tools@latest deploy --only firestore:rules,firestore:indexes,storage"
+    "deploy:firebase": "npx --yes firebase-tools@latest deploy --only firestore:rules,firestore:indexes"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.2",
