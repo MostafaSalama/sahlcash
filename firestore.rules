@@ -1,0 +1,128 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function storePath(storeId) {
+      return /databases/$(database)/documents/stores/$(storeId);
+    }
+
+    function storeUserPath(storeId, uid) {
+      return /databases/$(database)/documents/stores/$(storeId)/users/$(uid);
+    }
+
+    function userSnapshot(storeId) {
+      return get(storeUserPath(storeId, request.auth.uid));
+    }
+
+    function isStoreMember(storeId) {
+      return signedIn() &&
+        exists(storeUserPath(storeId, request.auth.uid)) &&
+        userSnapshot(storeId).data.active == true;
+    }
+
+    function isAdmin(storeId) {
+      return isStoreMember(storeId) && userSnapshot(storeId).data.role == 'admin';
+    }
+
+    match /userStores/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create: if signedIn() && request.auth.uid == uid &&
+        request.resource.data.keys().hasOnly(['storeId']);
+      allow update: if signedIn() && request.auth.uid == uid &&
+        request.resource.data.keys().hasOnly(['storeId']);
+      allow delete: if signedIn() && request.auth.uid == uid;
+    }
+
+    match /publicStoreInvites/{code} {
+      allow read: if true;
+      allow create: if signedIn() &&
+        request.resource.data.keys().hasOnly(['storeId']) &&
+        exists(storePath(request.resource.data.storeId)) &&
+        get(storePath(request.resource.data.storeId)).data.ownerId == request.auth.uid &&
+        get(storePath(request.resource.data.storeId)).data.inviteCode == code;
+      allow update: if false;
+      allow delete: if signedIn() &&
+        resource.data.storeId is string &&
+        exists(storePath(resource.data.storeId)) &&
+        get(storePath(resource.data.storeId)).data.ownerId == request.auth.uid;
+    }
+
+    match /stores/{storeId} {
+      allow read: if isStoreMember(storeId);
+      allow create: if signedIn() &&
+        request.resource.data.ownerId == request.auth.uid &&
+        request.resource.data.inviteCode is string;
+      allow update: if isAdmin(storeId);
+
+      match /users/{userId} {
+        allow read: if isStoreMember(storeId);
+
+        allow create: if signedIn() && request.auth.uid == userId && (
+          (
+            request.resource.data.role == 'admin' &&
+            exists(storePath(storeId)) &&
+            get(storePath(storeId)).data.ownerId == userId
+          ) ||
+          (
+            request.resource.data.role == 'cashier' &&
+            request.resource.data.inviteCodeUsed is string &&
+            exists(/databases/$(database)/documents/publicStoreInvites/$(request.resource.data.inviteCodeUsed)) &&
+            get(/databases/$(database)/documents/publicStoreInvites/$(request.resource.data.inviteCodeUsed)).data.storeId == storeId
+          )
+        );
+
+        allow update: if isAdmin(storeId) || (
+          request.auth.uid == userId &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'inviteCodeUsed'])
+        );
+      }
+
+      match /wallets/{walletId} {
+        allow read: if isStoreMember(storeId);
+        allow write: if isAdmin(storeId);
+      }
+
+      match /walletBalances/{walletId} {
+        allow read: if isStoreMember(storeId);
+        allow create: if isAdmin(storeId);
+        allow update: if isStoreMember(storeId);
+        allow delete: if isAdmin(storeId);
+      }
+
+      match /walletRecharges/{rechargeId} {
+        allow read: if isStoreMember(storeId);
+        allow create: if isStoreMember(storeId);
+        allow update, delete: if false;
+      }
+
+      match /shifts/{shiftId} {
+        allow read: if isStoreMember(storeId);
+        allow create: if isStoreMember(storeId);
+        allow update: if isAdmin(storeId) || (
+          isStoreMember(storeId) && resource.data.status == 'open'
+        );
+
+        match /transactions/{txId} {
+          allow read: if isStoreMember(storeId);
+          allow create: if isStoreMember(storeId);
+          allow update, delete: if false;
+        }
+
+        match /expenses/{exId} {
+          allow read: if isStoreMember(storeId);
+          allow create: if isStoreMember(storeId);
+          allow update, delete: if false;
+        }
+      }
+
+      match /corrections/{corrId} {
+        allow read: if isStoreMember(storeId);
+        allow create: if isAdmin(storeId);
+        allow update, delete: if false;
+      }
+    }
+  }
+}
