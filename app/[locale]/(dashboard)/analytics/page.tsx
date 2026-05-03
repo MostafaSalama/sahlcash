@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslations, useLocale } from "next-intl";
 import {
   collection,
@@ -33,6 +33,8 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -40,10 +42,21 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { toast } from "sonner";
+import { Skeleton } from "@/components/ui/skeleton";
 import { useAuth } from "@/contexts/auth-context";
 import { getDb } from "@/lib/firebase/client";
+import { downloadCsv } from "@/lib/csv";
 import { formatMoney } from "@/lib/utils";
-import type { ShiftDoc } from "@/types/firestore";
+import type { ShiftDoc, TransactionDoc, WalletDoc } from "@/types/firestore";
 
 const PIE_COLORS = [
   "#4f46e5",
@@ -54,11 +67,26 @@ const PIE_COLORS = [
   "#64748b",
 ];
 
-function daysAgo(n: number) {
-  const d = new Date();
-  d.setDate(d.getDate() - n);
-  d.setHours(0, 0, 0, 0);
-  return d;
+function isoDate(d: Date) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function startOfDayFromStr(dateStr: string) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y!, m! - 1, d!, 0, 0, 0, 0);
+}
+
+function endOfDayFromStr(dateStr: string) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y!, m! - 1, d!, 23, 59, 59, 999);
+}
+
+function shiftClosedDate(s: ShiftDoc): Date | null {
+  if (!s.closedAt) return null;
+  return s.closedAt instanceof Timestamp ? s.closedAt.toDate() : new Date();
 }
 
 export default function AnalyticsPage() {
@@ -68,10 +96,22 @@ export default function AnalyticsPage() {
   const locale = useLocale();
   const moneyLocale = locale === "ar" ? "ar-EG" : "en-US";
   const { storeId, store } = useAuth();
-  const [range, setRange] = useState<7 | 30 | 90>(30);
+
+  const [dateFromStr, setDateFromStr] = useState(() => {
+    const end = new Date();
+    end.setHours(0, 0, 0, 0);
+    const start = new Date(end);
+    start.setDate(start.getDate() - 30);
+    return isoDate(start);
+  });
+  const [dateToStr, setDateToStr] = useState(() => isoDate(new Date()));
+
   const [cashierKey, setCashierKey] = useState<string>("__all__");
   const [shifts, setShifts] = useState<(ShiftDoc & { id: string })[]>([]);
+  const [wallets, setWallets] = useState<(WalletDoc & { id: string })[]>([]);
   const [loading, setLoading] = useState(true);
+  const [walletFeeAgg, setWalletFeeAgg] = useState<Record<string, number>>({});
+  const [feeAggLoading, setFeeAggLoading] = useState(false);
 
   useEffect(() => {
     if (!storeId) return;
@@ -90,7 +130,20 @@ export default function AnalyticsPage() {
           id: d.id,
           ...(d.data() as ShiftDoc),
         }));
-        if (!cancelled) setShifts(rows);
+        const wSnap = await getDocs(
+          collection(db, "stores", storeId, "wallets")
+        );
+        const wRows = wSnap.docs.map((d) => ({
+          id: d.id,
+          ...(d.data() as WalletDoc),
+        }));
+        if (!cancelled) {
+          setShifts(rows);
+          setWallets(wRows);
+        }
+      } catch (e) {
+        console.error(e);
+        if (!cancelled) toast.error(tc("error"));
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -98,20 +151,21 @@ export default function AnalyticsPage() {
     return () => {
       cancelled = true;
     };
-  }, [storeId]);
+  }, [storeId, tc]);
 
   const currency = store?.currency ?? "EGP";
 
-  const since = useMemo(() => daysAgo(range), [range]);
+  const rangeStart = useMemo(() => startOfDayFromStr(dateFromStr), [dateFromStr]);
+  const rangeEnd = useMemo(() => endOfDayFromStr(dateToStr), [dateToStr]);
 
   const closedInRange = useMemo(() => {
     return shifts.filter((s) => {
       if (s.status !== "closed" || !s.closedAt) return false;
-      const cd =
-        s.closedAt instanceof Timestamp ? s.closedAt.toDate() : new Date();
-      return cd >= since;
+      const cd = shiftClosedDate(s);
+      if (!cd) return false;
+      return cd >= rangeStart && cd <= rangeEnd;
     });
-  }, [shifts, since]);
+  }, [shifts, rangeStart, rangeEnd]);
 
   const cashierOptions = useMemo(() => {
     const set = new Set<string>();
@@ -132,6 +186,139 @@ export default function AnalyticsPage() {
       (s) => (s.cashierEmail ?? s.cashierId) === cashierKey
     );
   }, [closedInRange, cashierKey]);
+
+  useEffect(() => {
+    if (!storeId || filtered.length === 0) {
+      setWalletFeeAgg({});
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      setFeeAggLoading(true);
+      try {
+        const db = getDb();
+        const agg: Record<string, number> = {};
+        for (const s of filtered) {
+          const snap = await getDocs(
+            collection(
+              db,
+              "stores",
+              storeId,
+              "shifts",
+              s.id,
+              "transactions"
+            )
+          );
+          for (const d of snap.docs) {
+            const tx = d.data() as TransactionDoc;
+            agg[tx.walletId] = (agg[tx.walletId] ?? 0) + (tx.fee ?? 0);
+          }
+        }
+        if (!cancelled) setWalletFeeAgg(agg);
+      } catch (e) {
+        console.error(e);
+        if (!cancelled) toast.error(tc("error"));
+      } finally {
+        if (!cancelled) setFeeAggLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [storeId, filtered, tc]);
+
+  const walletLabel = useCallback(
+    (id: string) => {
+      const w = wallets.find((x) => x.id === id);
+      if (!w) return id;
+      return locale === "ar" ? w.nameAr || w.nameEn : w.nameEn || w.nameAr;
+    },
+    [wallets, locale]
+  );
+
+  const cashierLeaderboard = useMemo(() => {
+    const m = new Map<
+      string,
+      {
+        fees: number;
+        volume: number;
+        expenses: number;
+        absDisc: number;
+        shifts: number;
+      }
+    >();
+    for (const s of closedInRange) {
+      const key = s.cashierEmail ?? s.cashierId;
+      const prev = m.get(key) ?? {
+        fees: 0,
+        volume: 0,
+        expenses: 0,
+        absDisc: 0,
+        shifts: 0,
+      };
+      prev.fees += s.summary?.totalFees ?? 0;
+      prev.volume += s.summary?.totalVolume ?? 0;
+      prev.expenses += s.summary?.totalExpenses ?? 0;
+      prev.shifts += 1;
+      if (s.discrepancies) {
+        for (const v of Object.values(s.discrepancies)) {
+          prev.absDisc += Math.abs(v);
+        }
+      }
+      m.set(key, prev);
+    }
+    return Array.from(m.entries()).sort((a, b) => b[1].fees - a[1].fees);
+  }, [closedInRange]);
+
+  const feesByWalletChart = useMemo(() => {
+    const total = Object.values(walletFeeAgg).reduce((a, b) => a + b, 0);
+    const rows = Object.entries(walletFeeAgg)
+      .map(([walletId, fees]) => ({
+        name: walletLabel(walletId),
+        fees,
+        pct: total > 0 ? Math.round((fees / total) * 1000) / 10 : 0,
+      }))
+      .sort((a, b) => b.fees - a.fees)
+      .slice(0, 14);
+    return rows;
+  }, [walletFeeAgg, walletLabel]);
+
+  const applyPreset = (days: number) => {
+    const end = new Date();
+    end.setHours(0, 0, 0, 0);
+    const start = new Date(end);
+    start.setDate(start.getDate() - days);
+    setDateFromStr(isoDate(start));
+    setDateToStr(isoDate(new Date()));
+  };
+
+  const exportAnalyticsCsv = () => {
+    const header = [
+      "shiftId",
+      "closedDay",
+      "cashier",
+      "fees",
+      "volume",
+      "expenses",
+      "transactions",
+    ];
+    const rows = filtered.map((s) => {
+      const cd = shiftClosedDate(s);
+      return [
+        s.id,
+        cd ? cd.toISOString().slice(0, 10) : "",
+        s.cashierEmail ?? s.cashierId,
+        s.summary?.totalFees ?? 0,
+        s.summary?.totalVolume ?? 0,
+        s.summary?.totalExpenses ?? 0,
+        s.summary?.transactionCount ?? 0,
+      ];
+    });
+    downloadCsv(`sahl-analytics-${dateFromStr}-${dateToStr}.csv`, [
+      header,
+      ...rows,
+    ]);
+  };
 
   const kpis = useMemo(() => {
     let totalFees = 0;
@@ -171,8 +358,8 @@ export default function AnalyticsPage() {
       }
     >();
     for (const s of filtered) {
-      const cd =
-        s.closedAt instanceof Timestamp ? s.closedAt.toDate() : new Date();
+      const cd = shiftClosedDate(s);
+      if (!cd) continue;
       const key = cd.toISOString().slice(0, 10);
       const prev =
         map.get(key) ??
@@ -197,8 +384,8 @@ export default function AnalyticsPage() {
   const discrepancySeries = useMemo(() => {
     const map = new Map<string, { day: string; absDisc: number }>();
     for (const s of filtered) {
-      const cd =
-        s.closedAt instanceof Timestamp ? s.closedAt.toDate() : new Date();
+      const cd = shiftClosedDate(s);
+      if (!cd) continue;
       const key = cd.toISOString().slice(0, 10);
       let disc = 0;
       if (s.discrepancies) {
@@ -232,6 +419,8 @@ export default function AnalyticsPage() {
   const fmtMoneyAxis = (v: number) =>
     formatMoney(v, currency, moneyLocale).replace(/\s/g, " ");
 
+  const pieEmpty = !loading && typePieData.length === 0;
+
   return (
     <AdminGate>
       <div className="mx-auto flex max-w-6xl flex-col gap-6">
@@ -241,21 +430,19 @@ export default function AnalyticsPage() {
             <p className="text-muted-foreground">{t("subtitle")}</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            {([7, 30, 90] as const).map((d) => (
-              <Button
-                key={d}
-                type="button"
-                size="sm"
-                variant={range === d ? "default" : "outline"}
-                onClick={() => setRange(d)}
-              >
-                {d === 7 ? t("range7") : d === 30 ? t("range30") : t("range90")}
-              </Button>
-            ))}
-            <Select
-              value={cashierKey}
-              onValueChange={(v) => setCashierKey(v)}
-            >
+            <Button type="button" size="sm" variant="outline" onClick={() => applyPreset(7)}>
+              {t("range7")}
+            </Button>
+            <Button type="button" size="sm" variant="outline" onClick={() => applyPreset(30)}>
+              {t("range30")}
+            </Button>
+            <Button type="button" size="sm" variant="outline" onClick={() => applyPreset(90)}>
+              {t("range90")}
+            </Button>
+            <Button type="button" size="sm" variant="secondary" onClick={exportAnalyticsCsv}>
+              {t("exportCsv")}
+            </Button>
+            <Select value={cashierKey} onValueChange={(v) => setCashierKey(v)}>
               <SelectTrigger className="w-[220px]">
                 <SelectValue placeholder={t("filterCashier")} />
               </SelectTrigger>
@@ -271,6 +458,31 @@ export default function AnalyticsPage() {
           </div>
         </div>
 
+        <Card>
+          <CardHeader>
+            <CardTitle>{t("dateRangeTitle")}</CardTitle>
+            <CardDescription>{t("dateRangeHint")}</CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-wrap items-end gap-4">
+            <div className="space-y-2">
+              <Label>{t("dateFrom")}</Label>
+              <Input
+                type="date"
+                value={dateFromStr}
+                onChange={(e) => setDateFromStr(e.target.value)}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>{t("dateTo")}</Label>
+              <Input
+                type="date"
+                value={dateToStr}
+                onChange={(e) => setDateToStr(e.target.value)}
+              />
+            </div>
+          </CardContent>
+        </Card>
+
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <Card>
             <CardHeader className="pb-2">
@@ -279,7 +491,7 @@ export default function AnalyticsPage() {
               </CardTitle>
             </CardHeader>
             <CardContent className="text-2xl font-semibold">
-              {loading ? "…" : kpis.shiftsClosed}
+              {loading ? <Skeleton className="h-9 w-16" /> : kpis.shiftsClosed}
             </CardContent>
           </Card>
           <Card>
@@ -289,9 +501,11 @@ export default function AnalyticsPage() {
               </CardTitle>
             </CardHeader>
             <CardContent className="text-2xl font-semibold">
-              {loading
-                ? "…"
-                : formatMoney(kpis.avgFeesPerShift, currency, moneyLocale)}
+              {loading ? (
+                <Skeleton className="h-9 w-36" />
+              ) : (
+                formatMoney(kpis.avgFeesPerShift, currency, moneyLocale)
+              )}
             </CardContent>
           </Card>
           <Card>
@@ -301,9 +515,11 @@ export default function AnalyticsPage() {
               </CardTitle>
             </CardHeader>
             <CardContent className="text-2xl font-semibold">
-              {loading
-                ? "…"
-                : formatMoney(kpis.totalExpenses, currency, moneyLocale)}
+              {loading ? (
+                <Skeleton className="h-9 w-36" />
+              ) : (
+                formatMoney(kpis.totalExpenses, currency, moneyLocale)
+              )}
             </CardContent>
           </Card>
           <Card>
@@ -313,9 +529,11 @@ export default function AnalyticsPage() {
               </CardTitle>
             </CardHeader>
             <CardContent className="text-2xl font-semibold">
-              {loading
-                ? "…"
-                : formatMoney(kpis.netAfterPetty, currency, moneyLocale)}
+              {loading ? (
+                <Skeleton className="h-9 w-36" />
+              ) : (
+                formatMoney(kpis.netAfterPetty, currency, moneyLocale)
+              )}
             </CardContent>
           </Card>
         </div>
@@ -328,7 +546,7 @@ export default function AnalyticsPage() {
               </CardTitle>
             </CardHeader>
             <CardContent className="text-2xl font-semibold">
-              {loading ? "…" : kpis.totalTx}
+              {loading ? <Skeleton className="h-9 w-20" /> : kpis.totalTx}
             </CardContent>
           </Card>
           <Card>
@@ -338,10 +556,90 @@ export default function AnalyticsPage() {
               </CardTitle>
             </CardHeader>
             <CardContent className="text-2xl font-semibold">
-              {loading ? "…" : kpis.totalRecharges}
+              {loading ? (
+                <Skeleton className="h-9 w-20" />
+              ) : (
+                kpis.totalRecharges
+              )}
             </CardContent>
           </Card>
         </div>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>{t("cashierLeaderboard")}</CardTitle>
+            <CardDescription>{t("cashierLeaderboardHint")}</CardDescription>
+          </CardHeader>
+          <CardContent className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>{t("filterCashier")}</TableHead>
+                  <TableHead className="text-end">{t("kpiShiftsClosed")}</TableHead>
+                  <TableHead className="text-end">{t("totalFeesCol")}</TableHead>
+                  <TableHead className="text-end">{t("totalVolumeCol")}</TableHead>
+                  <TableHead className="text-end">{t("kpiTotalExpenses")}</TableHead>
+                  <TableHead className="text-end">{t("absDiscCol")}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {cashierLeaderboard.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={6}>{tc("noData")}</TableCell>
+                  </TableRow>
+                ) : (
+                  cashierLeaderboard.map(([name, v]) => (
+                    <TableRow key={name}>
+                      <TableCell>{name}</TableCell>
+                      <TableCell className="text-end">{v.shifts}</TableCell>
+                      <TableCell className="text-end font-mono text-sm">
+                        {formatMoney(v.fees, currency, moneyLocale)}
+                      </TableCell>
+                      <TableCell className="text-end font-mono text-sm">
+                        {formatMoney(v.volume, currency, moneyLocale)}
+                      </TableCell>
+                      <TableCell className="text-end font-mono text-sm">
+                        {formatMoney(v.expenses, currency, moneyLocale)}
+                      </TableCell>
+                      <TableCell className="text-end font-mono text-sm">
+                        {formatMoney(v.absDisc, currency, moneyLocale)}
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>{t("feesByWalletTitle")}</CardTitle>
+            <CardDescription>{t("feesByWalletHint")}</CardDescription>
+          </CardHeader>
+          <CardContent className="h-72">
+            {feeAggLoading || loading ? (
+              <Skeleton className="mx-auto mt-8 h-48 w-full max-w-lg" />
+            ) : feesByWalletChart.length === 0 ? (
+              <p>{tc("noData")}</p>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={feesByWalletChart} layout="vertical">
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis type="number" tickFormatter={fmtMoneyAxis} />
+                  <YAxis type="category" dataKey="name" width={120} />
+                  <Tooltip
+                    formatter={(value, _name, item) => [
+                      `${formatMoney(Number(value ?? 0), currency, moneyLocale)} (${(item?.payload as { pct?: number })?.pct ?? 0}%)`,
+                      t("feeLeakageLabel"),
+                    ]}
+                  />
+                  <Bar dataKey="fees" fill="#7c3aed" radius={[0, 6, 6, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            )}
+          </CardContent>
+        </Card>
 
         <Card>
           <CardHeader>
@@ -405,7 +703,9 @@ export default function AnalyticsPage() {
             <CardTitle>{t("transactionTypeMix")}</CardTitle>
           </CardHeader>
           <CardContent className="h-72">
-            {loading || typePieData.length === 0 ? (
+            {loading ? (
+              <p>{tc("loading")}</p>
+            ) : pieEmpty ? (
               <p>{tc("noData")}</p>
             ) : (
               <ResponsiveContainer width="100%" height="100%">

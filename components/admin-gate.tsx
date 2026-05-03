@@ -11,7 +11,7 @@ export function AdminGate({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (profile && profile.role !== "admin") {
-      router.replace("/dashboard");
+      router.replace("/forbidden");
     }
   }, [profile, router]);
 

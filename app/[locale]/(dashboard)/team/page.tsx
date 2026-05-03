@@ -4,9 +4,11 @@ import { useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import {
   collection,
+  deleteDoc,
   doc,
   onSnapshot,
   serverTimestamp,
+  Timestamp,
   updateDoc,
   writeBatch,
 } from "firebase/firestore";
@@ -14,6 +16,8 @@ import { toast } from "sonner";
 import { AdminGate } from "@/components/admin-gate";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Table,
   TableBody,
@@ -33,6 +37,7 @@ export default function TeamPage() {
   const tc = useTranslations("common");
   const { storeId, store } = useAuth();
   const [members, setMembers] = useState<(StoreUserDoc & { id: string })[]>([]);
+  const [inviteExpiryHours, setInviteExpiryHours] = useState("");
 
   useEffect(() => {
     if (!storeId) return;
@@ -52,24 +57,49 @@ export default function TeamPage() {
 
   async function regenerate() {
     if (!storeId || !store?.inviteCode) return;
-    const db = getDb();
-    const oldCode = store.inviteCode;
-    const newCode = randomInviteCode(8);
-    const batch = writeBatch(db);
-    batch.update(doc(db, "stores", storeId), {
-      inviteCode: newCode,
-      updatedAt: serverTimestamp(),
-    });
-    batch.delete(doc(db, "publicStoreInvites", oldCode));
-    batch.set(doc(db, "publicStoreInvites", newCode), { storeId });
-    await batch.commit();
-    toast.success(tc("save"));
+    try {
+      const db = getDb();
+      const oldCode = store.inviteCode;
+      const newCode = randomInviteCode(8);
+      const batch = writeBatch(db);
+      batch.update(doc(db, "stores", storeId), {
+        inviteCode: newCode,
+        updatedAt: serverTimestamp(),
+      });
+      batch.delete(doc(db, "publicStoreInvites", oldCode));
+      const hours = Number(inviteExpiryHours);
+      const invitePayload: Record<string, unknown> = { storeId };
+      if (!Number.isNaN(hours) && hours > 0) {
+        invitePayload.expiresAt = Timestamp.fromMillis(
+          Date.now() + hours * 3600 * 1000
+        );
+      }
+      batch.set(doc(db, "publicStoreInvites", newCode), invitePayload);
+      await batch.commit();
+      setInviteExpiryHours("");
+      toast.success(tc("save"));
+    } catch (e) {
+      console.error(e);
+      toast.error(tc("error"));
+    }
   }
 
   async function copyCode() {
     if (!store?.inviteCode) return;
     await navigator.clipboard.writeText(store.inviteCode);
     toast.success(tc("save"));
+  }
+
+  async function revokeInvite() {
+    if (!storeId || !store?.inviteCode) return;
+    try {
+      const db = getDb();
+      await deleteDoc(doc(db, "publicStoreInvites", store.inviteCode));
+      toast.success(t("revokeSuccess"));
+    } catch (e) {
+      console.error(e);
+      toast.error(tc("error"));
+    }
   }
 
   async function toggleMember(m: StoreUserDoc & { id: string }) {
@@ -91,18 +121,36 @@ export default function TeamPage() {
         <Card>
           <CardHeader>
             <CardTitle>{t("inviteCodeLabel")}</CardTitle>
-            <CardDescription>{t("subtitle")}</CardDescription>
+            <CardDescription>
+              {t("subtitle")} — {t("revokeInviteHint")}
+            </CardDescription>
           </CardHeader>
-          <CardContent className="flex flex-wrap items-center gap-3">
-            <code className="rounded-md bg-muted px-3 py-2 text-lg tracking-widest">
-              {store?.inviteCode ?? "—"}
-            </code>
-            <Button type="button" variant="outline" onClick={() => void copyCode()}>
-              {t("copy")}
-            </Button>
-            <Button type="button" variant="secondary" onClick={() => void regenerate()}>
-              {t("regenerate")}
-            </Button>
+          <CardContent className="flex flex-col gap-4">
+            <div className="flex flex-wrap items-center gap-3">
+              <code className="rounded-md bg-muted px-3 py-2 text-lg tracking-widest">
+                {store?.inviteCode ?? "—"}
+              </code>
+              <Button type="button" variant="outline" onClick={() => void copyCode()}>
+                {t("copy")}
+              </Button>
+              <Button type="button" variant="secondary" onClick={() => void regenerate()}>
+                {t("regenerate")}
+              </Button>
+              <Button type="button" variant="destructive" onClick={() => void revokeInvite()}>
+                {t("revokeInvite")}
+              </Button>
+            </div>
+            <div className="flex max-w-xs flex-col gap-2">
+              <Label htmlFor="inviteExp">{t("inviteExpiryHours")}</Label>
+              <Input
+                id="inviteExp"
+                type="number"
+                min={1}
+                placeholder={t("inviteExpiryHint")}
+                value={inviteExpiryHours}
+                onChange={(e) => setInviteExpiryHours(e.target.value)}
+              />
+            </div>
           </CardContent>
         </Card>
 

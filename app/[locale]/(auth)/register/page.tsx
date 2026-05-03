@@ -13,6 +13,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAuth } from "@/contexts/auth-context";
+import { firebaseAuthMessageKey } from "@/lib/firebase-auth-message-key";
 
 const ownerSchema = z
   .object({
@@ -82,11 +83,18 @@ export default function RegisterPage() {
         storeName: values.storeName,
         displayName: values.displayName,
       });
-      toast.success("OK");
+      toast.success(t("verificationEmailSent"));
       router.replace("/dashboard");
-    } catch (e) {
+    } catch (e: unknown) {
       console.error(e);
-      toast.error(tc("error"));
+      let msg = tc("error");
+      if (e instanceof Error && e.message === "ALREADY_HAS_STORE") {
+        msg = t("alreadyHasStore");
+      } else {
+        const key = firebaseAuthMessageKey(e);
+        if (key) msg = t(key);
+      }
+      toast.error(msg);
     } finally {
       setPending(false);
     }
@@ -101,14 +109,19 @@ export default function RegisterPage() {
         inviteCode: values.inviteCode,
         displayName: values.displayName,
       });
-      toast.success("OK");
+      toast.success(t("verificationEmailSent"));
       router.replace("/dashboard");
     } catch (e: unknown) {
       console.error(e);
-      const msg =
-        e instanceof Error && e.message === "INVALID_INVITE"
-          ? t("invalidInvite")
-          : tc("error");
+      let msg = tc("error");
+      if (e instanceof Error && e.message === "INVALID_INVITE") {
+        msg = t("invalidInvite");
+      } else if (e instanceof Error && e.message === "INVITE_EXPIRED") {
+        msg = t("inviteExpired");
+      } else {
+        const key = firebaseAuthMessageKey(e);
+        if (key) msg = t(key);
+      }
       toast.error(msg);
     } finally {
       setPending(false);
@@ -119,7 +132,7 @@ export default function RegisterPage() {
     <Card className="w-full max-w-md border bg-card shadow-lg">
       <CardHeader>
         <CardTitle>{t("signUp")}</CardTitle>
-        <CardDescription>SahlCash</CardDescription>
+        <CardDescription>{t("appTagline")}</CardDescription>
       </CardHeader>
       <CardContent>
         <Tabs value={tab} onValueChange={(v) => setTab(v as "owner" | "cashier")}>
@@ -149,7 +162,9 @@ export default function RegisterPage() {
                 ) : null}
               </div>
               <div className="space-y-2">
-                <Label>{tc("optional")} — display name</Label>
+                <Label>
+                  {tc("optional")} — {t("displayName")}
+                </Label>
                 <Input {...ownerForm.register("displayName")} />
               </div>
               <Button type="submit" className="w-full" disabled={pending}>
@@ -180,7 +195,7 @@ export default function RegisterPage() {
                 ) : null}
               </div>
               <div className="space-y-2">
-                <Label>Display name</Label>
+                <Label>{t("displayName")}</Label>
                 <Input {...cashierForm.register("displayName")} />
               </div>
               <Button type="submit" className="w-full" disabled={pending}>

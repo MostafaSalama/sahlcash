@@ -27,6 +27,15 @@ service cloud.firestore {
       return isStoreMember(storeId) && userSnapshot(storeId).data.role == 'admin';
     }
 
+    function publicInviteDoc(code) {
+      return get(/databases/$(database)/documents/publicStoreInvites/$(code));
+    }
+
+    function inviteNotExpired(code) {
+      return !publicInviteDoc(code).data.keys().hasAny(['expiresAt']) ||
+        publicInviteDoc(code).data.expiresAt > request.time;
+    }
+
     match /userStores/{uid} {
       allow read: if signedIn() && request.auth.uid == uid;
       allow create: if signedIn() && request.auth.uid == uid &&
@@ -37,9 +46,10 @@ service cloud.firestore {
     }
 
     match /publicStoreInvites/{code} {
-      allow read: if true;
+      allow read: if signedIn();
       allow create: if signedIn() &&
-        request.resource.data.keys().hasOnly(['storeId']) &&
+        request.resource.data.keys().hasOnly(['storeId', 'expiresAt']) &&
+        request.resource.data.storeId is string &&
         exists(storePath(request.resource.data.storeId)) &&
         get(storePath(request.resource.data.storeId)).data.ownerId == request.auth.uid &&
         get(storePath(request.resource.data.storeId)).data.inviteCode == code;
@@ -70,13 +80,16 @@ service cloud.firestore {
             request.resource.data.role == 'cashier' &&
             request.resource.data.inviteCodeUsed is string &&
             exists(/databases/$(database)/documents/publicStoreInvites/$(request.resource.data.inviteCodeUsed)) &&
-            get(/databases/$(database)/documents/publicStoreInvites/$(request.resource.data.inviteCodeUsed)).data.storeId == storeId
+            publicInviteDoc(request.resource.data.inviteCodeUsed).data.storeId == storeId &&
+            inviteNotExpired(request.resource.data.inviteCodeUsed)
           )
         );
 
         allow update: if isAdmin(storeId) || (
           request.auth.uid == userId &&
-          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'inviteCodeUsed'])
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'role', 'inviteCodeUsed', 'active'
+          ])
         );
       }
 
@@ -88,7 +101,10 @@ service cloud.firestore {
       match /walletBalances/{walletId} {
         allow read: if isStoreMember(storeId);
         allow create: if isAdmin(storeId);
-        allow update: if isStoreMember(storeId);
+        allow update: if isStoreMember(storeId) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'currentBalance', 'lastUpdatedAt'
+          ]);
         allow delete: if isAdmin(storeId);
       }
 
@@ -101,20 +117,37 @@ service cloud.firestore {
       match /shifts/{shiftId} {
         allow read: if isStoreMember(storeId);
         allow create: if isStoreMember(storeId);
-        allow update: if isAdmin(storeId) || (
-          isStoreMember(storeId) && resource.data.status == 'open'
-        );
+
+        function shiftAffected() {
+          return request.resource.data.diff(resource.data).affectedKeys();
+        }
+
+        allow update: if isAdmin(storeId) && resource.data.status == 'closed' &&
+          shiftAffected().hasOnly(['reconciledAt', 'reconciledBy']);
+
+        allow update: if isStoreMember(storeId) && resource.data.status == 'open' &&
+          request.resource.data.status == 'closed' &&
+          shiftAffected().hasOnly([
+            'status', 'declaredBalances', 'expectedBalances', 'discrepancies',
+            'summary', 'closedAt', 'handoverNote'
+          ]);
 
         match /transactions/{txId} {
           allow read: if isStoreMember(storeId);
           allow create: if isStoreMember(storeId);
-          allow update, delete: if false;
+          allow update: if isStoreMember(storeId) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['photoUrl']) &&
+            request.resource.data.photoUrl is string;
+          allow delete: if false;
         }
 
         match /expenses/{exId} {
           allow read: if isStoreMember(storeId);
           allow create: if isStoreMember(storeId);
-          allow update, delete: if false;
+          allow update: if isStoreMember(storeId) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['receiptUrl']) &&
+            request.resource.data.receiptUrl is string;
+          allow delete: if false;
         }
       }
 

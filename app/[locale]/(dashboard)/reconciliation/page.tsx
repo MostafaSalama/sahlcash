@@ -5,14 +5,17 @@ import { useTranslations, useLocale } from "next-intl";
 import {
   addDoc,
   collection,
+  doc,
   getDocs,
   limit,
   onSnapshot,
   orderBy,
   query,
   serverTimestamp,
+  Timestamp,
+  updateDoc,
+  where,
 } from "firebase/firestore";
-import { Timestamp } from "firebase/firestore";
 import { toast } from "sonner";
 import { AdminGate } from "@/components/admin-gate";
 import {
@@ -49,12 +52,21 @@ import { buildShiftLedgerLines } from "@/lib/build-shift-ledger-lines";
 import { downloadShiftLedgerPdf } from "@/lib/pdf-shift-report";
 import type { ShiftDoc, WalletDoc } from "@/types/firestore";
 
-function sameDay(a: Date, b: Date) {
-  return (
-    a.getFullYear() === b.getFullYear() &&
-    a.getMonth() === b.getMonth() &&
-    a.getDate() === b.getDate()
-  );
+function isoDate(d: Date) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function startOfDayFromStr(dateStr: string) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y!, m! - 1, d!, 0, 0, 0, 0);
+}
+
+function endOfDayFromStr(dateStr: string) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y!, m! - 1, d!, 23, 59, 59, 999);
 }
 
 export default function ReconciliationPage() {
@@ -65,10 +77,13 @@ export default function ReconciliationPage() {
   const moneyLocale = locale === "ar" ? "ar-EG" : "en-US";
   const { storeId, store, user } = useAuth();
 
-  const [dateStr, setDateStr] = useState(() => {
+  const [dateFromStr, setDateFromStr] = useState(() => {
     const d = new Date();
-    return d.toISOString().slice(0, 10);
+    d.setHours(0, 0, 0, 0);
+    return isoDate(d);
   });
+  const [dateToStr, setDateToStr] = useState(() => isoDate(new Date()));
+
   const [shifts, setShifts] = useState<(ShiftDoc & { id: string })[]>([]);
   const [wallets, setWallets] = useState<(WalletDoc & { id: string })[]>([]);
   const [loading, setLoading] = useState(true);
@@ -100,17 +115,26 @@ export default function ReconciliationPage() {
       setLoading(true);
       try {
         const db = getDb();
+        const fromTs = Timestamp.fromDate(startOfDayFromStr(dateFromStr));
+        const toTs = Timestamp.fromDate(endOfDayFromStr(dateToStr));
         const q = query(
           collection(db, "stores", storeId, "shifts"),
-          orderBy("startedAt", "desc"),
-          limit(120)
+          where("closedAt", ">=", fromTs),
+          where("closedAt", "<=", toTs),
+          orderBy("closedAt", "desc"),
+          limit(500)
         );
         const snap = await getDocs(q);
-        const rows = snap.docs.map((d) => ({
-          id: d.id,
-          ...(d.data() as ShiftDoc),
-        }));
+        const rows = snap.docs
+          .map((d) => ({
+            id: d.id,
+            ...(d.data() as ShiftDoc),
+          }))
+          .filter((s) => s.status === "closed");
         if (!cancelled) setShifts(rows);
+      } catch (e) {
+        console.error(e);
+        toast.error(tc("error"));
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -118,23 +142,9 @@ export default function ReconciliationPage() {
     return () => {
       cancelled = true;
     };
-  }, [storeId]);
+  }, [storeId, dateFromStr, dateToStr, tc]);
 
-  const selectedDate = useMemo(() => {
-    const [y, m, d] = dateStr.split("-").map(Number);
-    return new Date(y!, m! - 1, d!);
-  }, [dateStr]);
-
-  const dayShifts = useMemo(() => {
-    return shifts.filter((s) => {
-      if (s.status !== "closed" || !s.closedAt) return false;
-      const cd =
-        s.closedAt instanceof Timestamp
-          ? s.closedAt.toDate()
-          : new Date();
-      return sameDay(cd, selectedDate);
-    });
-  }, [shifts, selectedDate]);
+  const rangeShifts = shifts;
 
   const currency = store?.currency ?? "EGP";
 
@@ -143,18 +153,18 @@ export default function ReconciliationPage() {
     let fees = 0;
     let expenses = 0;
     let txCount = 0;
-    for (const s of dayShifts) {
+    for (const s of rangeShifts) {
       volume += s.summary?.totalVolume ?? 0;
       fees += s.summary?.totalFees ?? 0;
       expenses += s.summary?.totalExpenses ?? 0;
       txCount += s.summary?.transactionCount ?? 0;
     }
     return { volume, fees, expenses, txCount };
-  }, [dayShifts]);
+  }, [rangeShifts]);
 
   const walletAgg = useMemo(() => {
     const m: Record<string, { expected: number; declared: number }> = {};
-    for (const s of dayShifts) {
+    for (const s of rangeShifts) {
       for (const [k, v] of Object.entries(s.expectedBalances ?? {})) {
         if (!m[k]) m[k] = { expected: 0, declared: 0 };
         m[k]!.expected += v;
@@ -165,11 +175,11 @@ export default function ReconciliationPage() {
       }
     }
     return m;
-  }, [dayShifts]);
+  }, [rangeShifts]);
 
   const typeAgg = useMemo(() => {
     const m: Record<string, number> = {};
-    for (const s of dayShifts) {
+    for (const s of rangeShifts) {
       const c = s.summary?.countsByType;
       if (!c) continue;
       for (const [k, v] of Object.entries(c)) {
@@ -177,7 +187,7 @@ export default function ReconciliationPage() {
       }
     }
     return m;
-  }, [dayShifts]);
+  }, [rangeShifts]);
 
   function walletLabel(id: string) {
     const w = wallets.find((x) => x.id === id);
@@ -192,27 +202,63 @@ export default function ReconciliationPage() {
       toast.error(tc("required"));
       return;
     }
-    const db = getDb();
-    await addDoc(collection(db, "stores", storeId, "corrections"), {
-      shiftId: corrShiftId,
-      adminId: user.uid,
-      amount: amt,
-      reason: corrReason.trim(),
-      createdAt: serverTimestamp(),
-    });
-    setCorrAmount("");
-    setCorrReason("");
-    toast.success(tc("save"));
+    try {
+      const db = getDb();
+      await addDoc(collection(db, "stores", storeId, "corrections"), {
+        shiftId: corrShiftId,
+        adminId: user.uid,
+        amount: amt,
+        reason: corrReason.trim(),
+        createdAt: serverTimestamp(),
+      });
+      setCorrAmount("");
+      setCorrReason("");
+      toast.success(tc("save"));
+    } catch (e) {
+      console.error(e);
+      toast.error(tc("error"));
+    }
   }
 
-  function pdfForShift(s: ShiftDoc & { id: string }) {
-    const fmt = (n: number) => formatMoney(n, currency, moneyLocale);
-    const lines = buildShiftLedgerLines(s, walletLabel, fmt);
-    downloadShiftLedgerPdf({
-      title: `SahlCash shift ${s.id}`,
-      locale,
-      lines,
-    });
+  async function markShiftReconciled(s: ShiftDoc & { id: string }) {
+    if (!storeId || !user) return;
+    try {
+      const db = getDb();
+      await updateDoc(doc(db, "stores", storeId, "shifts", s.id), {
+        reconciledAt: serverTimestamp(),
+        reconciledBy: user.uid,
+      });
+      setShifts((prev) =>
+        prev.map((row) =>
+          row.id === s.id
+            ? {
+                ...row,
+                reconciledBy: user.uid,
+                reconciledAt: Timestamp.now(),
+              }
+            : row
+        )
+      );
+      toast.success(tc("save"));
+    } catch (e) {
+      console.error(e);
+      toast.error(tc("error"));
+    }
+  }
+
+  async function pdfForShift(s: ShiftDoc & { id: string }) {
+    try {
+      const fmt = (n: number) => formatMoney(n, currency, moneyLocale);
+      const lines = buildShiftLedgerLines(s, walletLabel, fmt);
+      await downloadShiftLedgerPdf({
+        title: `SahlCash shift ${s.id}`,
+        locale,
+        lines,
+      });
+    } catch (e) {
+      console.error(e);
+      toast.error(tc("error"));
+    }
   }
 
   return (
@@ -225,15 +271,24 @@ export default function ReconciliationPage() {
 
         <Card>
           <CardHeader>
-            <CardTitle>{t("selectDate")}</CardTitle>
+            <CardTitle>{t("dateRangeTitle")}</CardTitle>
+            <CardDescription>{t("dateRangeHint")}</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-wrap items-end gap-4">
             <div className="space-y-2">
-              <Label>{t("selectDate")}</Label>
+              <Label>{t("dateFrom")}</Label>
               <Input
                 type="date"
-                value={dateStr}
-                onChange={(e) => setDateStr(e.target.value)}
+                value={dateFromStr}
+                onChange={(e) => setDateFromStr(e.target.value)}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>{t("dateTo")}</Label>
+              <Input
+                type="date"
+                value={dateToStr}
+                onChange={(e) => setDateToStr(e.target.value)}
               />
             </div>
           </CardContent>
@@ -362,18 +417,37 @@ export default function ReconciliationPage() {
             <CardTitle>{t("ledgerTitle")}</CardTitle>
             <CardDescription>{t("ledgerSubtitle")}</CardDescription>
           </CardHeader>
-          <CardContent className="flex flex-wrap gap-2">
-            {dayShifts.map((s) => (
-              <Button
-                key={s.id}
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => pdfForShift(s)}
-              >
-                {tc("downloadPdf")} · {s.id.slice(0, 6)}
-              </Button>
-            ))}
+          <CardContent>
+            {rangeShifts.length === 0 ? (
+              <p className="text-sm text-muted-foreground">{tc("noData")}</p>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {rangeShifts.map((s) => (
+                  <div key={s.id} className="flex flex-wrap items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void pdfForShift(s)}
+                    >
+                      {tc("downloadPdf")} · {s.id.slice(0, 6)}
+                    </Button>
+                    {s.reconciledAt ? (
+                      <Badge variant="success">{t("reconciled")}</Badge>
+                    ) : (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => void markShiftReconciled(s)}
+                      >
+                        {t("markReconciled")}
+                      </Button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -390,7 +464,7 @@ export default function ReconciliationPage() {
                   <SelectValue placeholder={t("selectShift")} />
                 </SelectTrigger>
                 <SelectContent>
-                  {dayShifts.map((s) => (
+                  {rangeShifts.map((s) => (
                     <SelectItem key={s.id} value={s.id}>
                       {s.id.slice(0, 8)} · {s.cashierEmail ?? s.cashierId}
                     </SelectItem>

@@ -80,3 +80,19 @@ body {
 .font-ar {
   font-family: var(--font-arabic), var(--font-sans);
 }
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: white !important;
+  }
+  /* Shift detail: show every tab panel when printing with ?print=1 */
+  .shift-detail-print-tabs [role="tablist"] {
+    display: none !important;
+  }
+  .shift-detail-print-tabs [role="tabpanel"] {
+    display: block !important;
+  }
+}

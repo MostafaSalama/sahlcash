@@ -12,6 +12,7 @@ import {
 import {
   createUserWithEmailAndPassword,
   onAuthStateChanged,
+  sendEmailVerification,
   signInWithEmailAndPassword,
   signOut as firebaseSignOut,
   type User,
@@ -162,34 +163,57 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }) => {
       const auth = getFirebaseAuth();
       const db = getDb();
-      const cred = await createUserWithEmailAndPassword(
-        auth,
-        input.email.trim(),
-        input.password
-      );
+
+      // If the caller is already signed in (e.g. recovering from a previously
+      // failed registration where the Auth user was created but the Firestore
+      // writes were denied), reuse that account instead of creating a new one.
+      let user = auth.currentUser;
+      let createdNewAccount = false;
+      if (!user) {
+        const cred = await createUserWithEmailAndPassword(
+          auth,
+          input.email.trim(),
+          input.password
+        );
+        user = cred.user;
+        createdNewAccount = true;
+      } else {
+        // Block if the signed-in user already has a store mapping.
+        const existing = await getDoc(doc(db, "userStores", user.uid));
+        if (existing.exists()) {
+          throw new Error("ALREADY_HAS_STORE");
+        }
+      }
+
       const storeRef = doc(collection(db, "stores"));
       const newStoreId = storeRef.id;
       const inviteCode = randomInviteCode(8);
-      const batch = writeBatch(db);
-      batch.set(storeRef, {
+
+      // Phase 1: create the store doc on its own. Firestore rules evaluate
+      // each write in a batch against pre-batch state, so the membership and
+      // invite writes below need the store to already exist before they can
+      // pass `exists(storePath)` / `get(storePath).data.ownerId` checks.
+      await setDoc(storeRef, {
         name: input.storeName.trim(),
         currency: "EGP",
         timezone:
           typeof Intl !== "undefined"
             ? Intl.DateTimeFormat().resolvedOptions().timeZone
             : "Africa/Cairo",
-        ownerId: cred.user.uid,
+        ownerId: user.uid,
         inviteCode,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
+
+      const batch = writeBatch(db);
       batch.set(doc(db, "publicStoreInvites", inviteCode), {
         storeId: newStoreId,
       });
-      batch.set(doc(db, "userStores", cred.user.uid), {
+      batch.set(doc(db, "userStores", user.uid), {
         storeId: newStoreId,
       });
-      batch.set(doc(db, "stores", newStoreId, "users", cred.user.uid), {
+      batch.set(doc(db, "stores", newStoreId, "users", user.uid), {
         email: input.email.trim(),
         displayName: input.displayName.trim(),
         role: "admin",
@@ -198,6 +222,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       });
       await batch.commit();
       await seedDefaultWallets(db, newStoreId);
+      if (createdNewAccount) {
+        await sendEmailVerification(user).catch(() => {
+          /* non-fatal */
+        });
+      }
       setStoreId(newStoreId);
     },
     []
@@ -216,7 +245,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!inv.exists()) {
         throw new Error("INVALID_INVITE");
       }
-      const sid = inv.data().storeId as string;
+      const invData = inv.data();
+      const exp = invData.expiresAt as import("firebase/firestore").Timestamp | undefined;
+      if (exp && exp.toMillis() < Date.now()) {
+        throw new Error("INVITE_EXPIRED");
+      }
+      const sid = invData.storeId as string;
       const auth = getFirebaseAuth();
       const cred = await createUserWithEmailAndPassword(
         auth,
@@ -234,6 +268,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         createdAt: serverTimestamp(),
       });
       await batch.commit();
+      await sendEmailVerification(cred.user).catch(() => {
+        /* non-fatal */
+      });
       setStoreId(sid);
     },
     []

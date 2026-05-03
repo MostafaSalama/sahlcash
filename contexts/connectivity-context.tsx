@@ -6,9 +6,12 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
+import { useTranslations } from "next-intl";
+import { toast } from "sonner";
 import { getDb } from "@/lib/firebase/client";
 import { countPendingWrites, flushPendingWrites } from "@/lib/offline/sync";
 
@@ -24,8 +27,10 @@ const ConnectivityContext = createContext<
 >(undefined);
 
 export function ConnectivityProvider({ children }: { children: ReactNode }) {
+  const t = useTranslations("connectivity");
   const [online, setOnline] = useState(true);
   const [pendingSync, setPendingSync] = useState(0);
+  const prevOnlineRef = useRef<boolean | null>(null);
 
   const refreshPending = useCallback(async () => {
     const n = await countPendingWrites();
@@ -55,6 +60,18 @@ export function ConnectivityProvider({ children }: { children: ReactNode }) {
       window.removeEventListener("offline", off);
     };
   }, [flushSync, refreshPending]);
+
+  useEffect(() => {
+    if (prevOnlineRef.current === null) {
+      prevOnlineRef.current = online;
+      return;
+    }
+    if (prevOnlineRef.current !== online) {
+      if (online) toast.success(t("backOnline"));
+      else toast.warning(t("offlineMode"));
+      prevOnlineRef.current = online;
+    }
+  }, [online, t]);
 
   const value = useMemo(
     () => ({ online, pendingSync, refreshPending, flushSync }),

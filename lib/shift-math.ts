@@ -83,6 +83,7 @@ export function computeExpectedBalances(
   return expected;
 }
 
+/** Legacy: treats missing declared keys as 0 (avoid for shift close). */
 export function computeDiscrepancies(
   expected: Record<string, number>,
   declared: Record<string, number>
@@ -95,4 +96,27 @@ export function computeDiscrepancies(
     out[id] = roundMoney(dec - exp);
   }
   return out;
+}
+
+/** Shift close: every wallet must have an explicit declared balance (no silent zero). */
+export function computeDiscrepanciesForClose(
+  expected: Record<string, number>,
+  declared: Record<string, number>,
+  walletIds: string[]
+): {
+  ok: boolean;
+  discrepancies: Record<string, number>;
+  missingWalletIds: string[];
+} {
+  const missingWalletIds = walletIds.filter((id) => !(id in declared));
+  if (missingWalletIds.length > 0) {
+    return { ok: false, discrepancies: {}, missingWalletIds };
+  }
+  const discrepancies: Record<string, number> = {};
+  for (const id of walletIds) {
+    const exp = expected[id] ?? 0;
+    const dec = declared[id] ?? 0;
+    discrepancies[id] = roundMoney(dec - exp);
+  }
+  return { ok: true, discrepancies, missingWalletIds: [] };
 }

@@ -67,12 +67,23 @@ export async function commitShiftTransaction(
   storeId: string,
   shiftId: string,
   txPayload: Record<string, unknown>,
-  balanceDeltas: Record<string, number>
-) {
+  balanceDeltas: Record<string, number>,
+  transactionDocId?: string
+): Promise<{ id: string }> {
   const batch = writeBatch(db);
-  const txRef = doc(
-    collection(db, "stores", storeId, "shifts", shiftId, "transactions")
-  );
+  const txRef = transactionDocId
+    ? doc(
+        db,
+        "stores",
+        storeId,
+        "shifts",
+        shiftId,
+        "transactions",
+        transactionDocId
+      )
+    : doc(
+        collection(db, "stores", storeId, "shifts", shiftId, "transactions")
+      );
   batch.set(txRef, {
     ...stripBalanceMeta(txPayload),
     createdAt: serverTimestamp(),
@@ -86,6 +97,7 @@ export async function commitShiftTransaction(
     });
   }
   await batch.commit();
+  return { id: txRef.id };
 }
 
 export async function commitShiftExpenseWithBalances(
@@ -93,12 +105,13 @@ export async function commitShiftExpenseWithBalances(
   storeId: string,
   shiftId: string,
   expensePayload: Record<string, unknown>,
-  balanceDeltas: Record<string, number>
+  balanceDeltas: Record<string, number>,
+  expenseDocId?: string
 ) {
   const batch = writeBatch(db);
-  const exRef = doc(
-    collection(db, "stores", storeId, "shifts", shiftId, "expenses")
-  );
+  const exRef = expenseDocId
+    ? doc(db, "stores", storeId, "shifts", shiftId, "expenses", expenseDocId)
+    : doc(collection(db, "stores", storeId, "shifts", shiftId, "expenses"));
   batch.set(exRef, {
     ...stripBalanceMeta(expensePayload),
     createdAt: serverTimestamp(),

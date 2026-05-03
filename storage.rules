@@ -1,9 +1,41 @@
 rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
+    function memberPath(storeId) {
+      return /databases/(default)/documents/stores/$(storeId)/users/$(request.auth.uid);
+    }
+
+    function isActiveStoreMember(storeId) {
+      return request.auth != null &&
+        firestore.exists(memberPath(storeId)) &&
+        firestore.get(memberPath(storeId)).data.active == true;
+    }
+
+    function isAdmin(storeId) {
+      return isActiveStoreMember(storeId) &&
+        firestore.get(memberPath(storeId)).data.role == 'admin';
+    }
+
+    function isImage() {
+      return request.resource.contentType.matches('image/.*') &&
+        request.resource.size < 6 * 1024 * 1024;
+    }
+
     match /stores/{storeId}/shifts/{shiftId}/expenses/{fileName} {
-      allow read: if request.auth != null;
-      allow write: if request.auth != null && request.resource.size < 6 * 1024 * 1024;
+      allow read: if isActiveStoreMember(storeId);
+      allow create, update: if isActiveStoreMember(storeId) && isImage();
+      allow delete: if isAdmin(storeId);
+    }
+
+    match /stores/{storeId}/shifts/{shiftId}/transactions/{fileName} {
+      allow read: if isActiveStoreMember(storeId);
+      allow create, update: if isActiveStoreMember(storeId) && isImage();
+      allow delete: if isAdmin(storeId);
+    }
+
+    match /stores/{storeId}/wallets/{walletId}/{fileName} {
+      allow read: if isActiveStoreMember(storeId);
+      allow write: if isAdmin(storeId) && isImage();
     }
   }
 }

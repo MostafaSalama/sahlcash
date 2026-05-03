@@ -12,7 +12,9 @@ import {
   where,
 } from "firebase/firestore";
 import { Timestamp } from "firebase/firestore";
+import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useAuth } from "@/contexts/auth-context";
@@ -61,6 +63,9 @@ export default function DashboardPage() {
         );
         const openSnap = await getDocs(openQ);
         if (!cancelled) setOpenCount(openSnap.size);
+      } catch (e) {
+        console.error(e);
+        if (!cancelled) toast.error(tc("error"));
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -68,7 +73,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true;
     };
-  }, [storeId]);
+  }, [storeId, tc]);
 
   const today = startOfToday();
 
@@ -114,7 +119,11 @@ export default function DashboardPage() {
           </CardHeader>
           <CardContent>
             <p className="text-2xl font-semibold">
-              {loading ? "…" : formatMoney(metrics.volume, store?.currency ?? "EGP", moneyLocale)}
+              {loading ? (
+                <Skeleton className="h-9 w-32" />
+              ) : (
+                formatMoney(metrics.volume, store?.currency ?? "EGP", moneyLocale)
+              )}
             </p>
           </CardContent>
         </Card>
@@ -126,9 +135,11 @@ export default function DashboardPage() {
           </CardHeader>
           <CardContent>
             <p className="text-2xl font-semibold">
-              {loading
-                ? "…"
-                : formatMoney(metrics.fees, store?.currency ?? "EGP", moneyLocale)}
+              {loading ? (
+                <Skeleton className="h-9 w-32" />
+              ) : (
+                formatMoney(metrics.fees, store?.currency ?? "EGP", moneyLocale)
+              )}
             </p>
           </CardContent>
         </Card>
@@ -139,7 +150,9 @@ export default function DashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent className="flex items-center gap-2">
-            <p className="text-2xl font-semibold">{loading ? "…" : openCount}</p>
+            <p className="text-2xl font-semibold">
+              {loading ? <Skeleton className="h-9 w-16" /> : openCount}
+            </p>
             {!loading && openCount > 0 ? (
               <Badge variant="warning">{tc("open")}</Badge>
             ) : null}
@@ -152,7 +165,9 @@ export default function DashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-semibold">{loading ? "…" : metrics.disc}</p>
+            <p className="text-2xl font-semibold">
+              {loading ? <Skeleton className="h-9 w-16" /> : metrics.disc}
+            </p>
           </CardContent>
         </Card>
       </div>

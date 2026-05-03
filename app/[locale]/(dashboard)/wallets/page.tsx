@@ -11,6 +11,7 @@ import {
   updateDoc,
   writeBatch,
 } from "firebase/firestore";
+import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { toast } from "sonner";
 import { AdminGate } from "@/components/admin-gate";
 import {
@@ -48,7 +49,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { useAuth } from "@/contexts/auth-context";
-import { getDb } from "@/lib/firebase/client";
+import { getDb, getFirebaseStorage } from "@/lib/firebase/client";
 import { computeFee } from "@/lib/commission";
 import { commitWalletRecharge } from "@/lib/firebase/balance-batch";
 import { computeRechargeEffects } from "@/lib/transaction-effects";
@@ -69,7 +70,21 @@ function emptyForm(): Omit<WalletDoc, "createdAt" | "updatedAt"> & {
     isActive: true,
     sortOrder: 99,
     lowBalanceAlert: undefined,
+    photoUrl: undefined,
   };
+}
+
+async function uploadWalletPhoto(
+  storeId: string,
+  walletId: string,
+  file: File
+): Promise<string> {
+  const storage = getFirebaseStorage();
+  const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const path = `stores/${storeId}/wallets/${walletId}/${crypto.randomUUID()}_${safeName}`;
+  const r = ref(storage, path);
+  await uploadBytes(r, file, { contentType: file.type || "image/jpeg" });
+  return getDownloadURL(r);
 }
 
 export default function WalletsPage() {
@@ -87,6 +102,8 @@ export default function WalletsPage() {
   const [rechargeAmountStr, setRechargeAmountStr] = useState("");
   const [rechargeSource, setRechargeSource] =
     useState<RechargeSource>("cash");
+  const [photoFile, setPhotoFile] = useState<File | null>(null);
+  const [photoUploading, setPhotoUploading] = useState(false);
 
   const currency = store?.currency ?? "EGP";
   const cashWalletId = items.find((w) => w.type === "cash")?.id ?? null;
@@ -164,26 +181,70 @@ export default function WalletsPage() {
       toast.error(tc("required"));
       return;
     }
-    if (form.id) {
-      await updateDoc(doc(db, "stores", storeId, "wallets", form.id), {
-        ...payload,
-      });
-    } else {
-      const batch = writeBatch(db);
-      const ref = doc(collection(db, "stores", storeId, "wallets"));
-      batch.set(ref, {
-        ...payload,
-        createdAt: serverTimestamp(),
-      });
-      batch.set(doc(db, "stores", storeId, "walletBalances", ref.id), {
-        currentBalance: 0,
-        lastUpdatedAt: serverTimestamp(),
-      });
-      await batch.commit();
+
+    try {
+      let walletId = form.id ?? "";
+      if (form.id) {
+        if (form.photoUrl !== undefined) {
+          payload.photoUrl = form.photoUrl;
+        }
+        await updateDoc(doc(db, "stores", storeId, "wallets", form.id), {
+          ...payload,
+        });
+      } else {
+        const batch = writeBatch(db);
+        const ref = doc(collection(db, "stores", storeId, "wallets"));
+        walletId = ref.id;
+        const createPayload: Record<string, unknown> = {
+          ...payload,
+          createdAt: serverTimestamp(),
+        };
+        if (form.photoUrl) createPayload.photoUrl = form.photoUrl;
+        batch.set(ref, createPayload);
+        batch.set(doc(db, "stores", storeId, "walletBalances", ref.id), {
+          currentBalance: 0,
+          lastUpdatedAt: serverTimestamp(),
+        });
+        await batch.commit();
+      }
+
+      if (photoFile && walletId) {
+        setPhotoUploading(true);
+        const url = await uploadWalletPhoto(storeId, walletId, photoFile);
+        await updateDoc(doc(db, "stores", storeId, "wallets", walletId), {
+          photoUrl: url,
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      setOpen(false);
+      setForm(emptyForm());
+      setPhotoFile(null);
+      toast.success(tc("save"));
+    } catch (e) {
+      console.error(e);
+      toast.error(tc("error"));
+    } finally {
+      setPhotoUploading(false);
     }
-    setOpen(false);
-    setForm(emptyForm());
-    toast.success(tc("save"));
+  }
+
+  async function removeWalletPhoto(m: WalletDoc & { id: string }) {
+    if (!storeId) return;
+    try {
+      const db = getDb();
+      await updateDoc(doc(db, "stores", storeId, "wallets", m.id), {
+        photoUrl: deleteField(),
+        updatedAt: serverTimestamp(),
+      });
+      setForm((f) =>
+        f.id === m.id ? { ...f, photoUrl: undefined } : f
+      );
+      toast.success(tc("save"));
+    } catch (e) {
+      console.error(e);
+      toast.error(tc("error"));
+    }
   }
 
   async function toggleArchive(m: WalletDoc & { id: string }) {
@@ -255,6 +316,7 @@ export default function WalletsPage() {
               type="button"
               onClick={() => {
                 setForm(emptyForm());
+                setPhotoFile(null);
                 setOpen(true);
               }}
             >
@@ -279,6 +341,7 @@ export default function WalletsPage() {
                   <TableHeader>
                     <TableRow>
                       <TableHead>{tc("actions")}</TableHead>
+                      <TableHead className="w-[1%]">{t("photo")}</TableHead>
                       <TableHead>{t("balance")}</TableHead>
                       <TableHead>{t("nameEn")}</TableHead>
                       <TableHead>{t("type")}</TableHead>
@@ -290,7 +353,7 @@ export default function WalletsPage() {
                   <TableBody>
                     {items.filter((x) => x.isActive).length === 0 ? (
                       <TableRow>
-                        <TableCell colSpan={7}>{tc("noData")}</TableCell>
+                        <TableCell colSpan={8}>{tc("noData")}</TableCell>
                       </TableRow>
                     ) : (
                       items
@@ -305,6 +368,7 @@ export default function WalletsPage() {
                                 type="button"
                                 onClick={() => {
                                   setForm({ ...m });
+                                  setPhotoFile(null);
                                   setOpen(true);
                                 }}
                               >
@@ -318,6 +382,22 @@ export default function WalletsPage() {
                               >
                                 {t("archive")}
                               </Button>
+                            </TableCell>
+                            <TableCell>
+                              {m.photoUrl ? (
+                                /* eslint-disable-next-line @next/next/no-img-element */
+                                <img
+                                  src={m.photoUrl}
+                                  alt=""
+                                  className="h-10 w-10 rounded-md border object-cover"
+                                />
+                              ) : (
+                                <div
+                                  className="h-10 w-10 rounded-md border"
+                                  style={{ backgroundColor: m.color }}
+                                  aria-hidden
+                                />
+                              )}
                             </TableCell>
                             <TableCell>
                               <Badge variant="outline">
@@ -362,24 +442,32 @@ export default function WalletsPage() {
                   <TableHeader>
                     <TableRow>
                       <TableHead>{tc("actions")}</TableHead>
-                      <TableHead>Name</TableHead>
+                      <TableHead>{t("displayNameCol")}</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {items.filter((x) => !x.isActive).map((m) => (
-                      <TableRow key={m.id}>
-                        <TableCell>
-                          <Button
-                            size="sm"
-                            type="button"
-                            onClick={() => void toggleArchive(m)}
-                          >
-                            {t("restore")}
-                          </Button>
+                    {items.filter((x) => !x.isActive).length === 0 ? (
+                      <TableRow>
+                        <TableCell colSpan={2} className="text-muted-foreground">
+                          {t("archivedEmpty")}
                         </TableCell>
-                        <TableCell>{label(m)}</TableCell>
                       </TableRow>
-                    ))}
+                    ) : (
+                      items.filter((x) => !x.isActive).map((m) => (
+                        <TableRow key={m.id}>
+                          <TableCell>
+                            <Button
+                              size="sm"
+                              type="button"
+                              onClick={() => void toggleArchive(m)}
+                            >
+                              {t("restore")}
+                            </Button>
+                          </TableCell>
+                          <TableCell>{label(m)}</TableCell>
+                        </TableRow>
+                      ))
+                    )}
                   </TableBody>
                 </Table>
               </CardContent>
@@ -505,6 +593,51 @@ export default function WalletsPage() {
                   />
                 </div>
               </div>
+              <div className="space-y-2">
+                <Label>{t("photo")}</Label>
+                <div className="flex flex-wrap items-center gap-3">
+                  {form.photoUrl ? (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img
+                      src={form.photoUrl}
+                      alt=""
+                      className="h-16 w-16 rounded-md border object-cover"
+                    />
+                  ) : (
+                    <div
+                      className="h-16 w-16 rounded-md border"
+                      style={{ backgroundColor: form.color }}
+                      aria-hidden
+                    />
+                  )}
+                  <div className="flex flex-1 flex-col gap-2">
+                    <Input
+                      type="file"
+                      accept="image/*"
+                      onChange={(e) =>
+                        setPhotoFile(e.target.files?.[0] ?? null)
+                      }
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {t("photoHint")}
+                    </p>
+                  </div>
+                  {form.id && form.photoUrl ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() =>
+                        void removeWalletPhoto({
+                          ...(form as WalletDoc & { id: string }),
+                        })
+                      }
+                    >
+                      {t("removePhoto")}
+                    </Button>
+                  ) : null}
+                </div>
+              </div>
               <Badge variant="outline">
                 {t("previewFeeOn100", {
                   fee: formatMoney(previewFee, currency, moneyLocale),
@@ -515,7 +648,11 @@ export default function WalletsPage() {
               <Button variant="outline" type="button" onClick={() => setOpen(false)}>
                 {tc("cancel")}
               </Button>
-              <Button type="button" onClick={() => void saveWallet()}>
+              <Button
+                type="button"
+                disabled={photoUploading}
+                onClick={() => void saveWallet()}
+              >
                 {tc("save")}
               </Button>
             </DialogFooter>

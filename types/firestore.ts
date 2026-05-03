@@ -59,6 +59,8 @@ export interface WalletDoc {
   sortOrder: number;
   /** Alert when balance at or below this (optional; non-cash wallets) */
   lowBalanceAlert?: number;
+  /** Optional logo / photo (Storage download URL) */
+  photoUrl?: string;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -94,6 +96,11 @@ export interface ShiftDoc {
   summary?: ShiftSummary;
   startedAt: Timestamp;
   closedAt?: Timestamp;
+  /** Optional note shown on shift detail / PDF */
+  handoverNote?: string;
+  /** Admin reconciliation sign-off */
+  reconciledAt?: Timestamp;
+  reconciledBy?: string;
 }
 
 export interface ShiftSummary {
@@ -128,6 +135,8 @@ export interface TransactionDoc {
   customerName?: string;
   customerPhone?: string;
   note?: string;
+  /** Optional receipt / slip photo (Storage download URL) */
+  photoUrl?: string;
   createdAt: Timestamp;
   clientId?: string;
 }
@@ -154,7 +163,39 @@ export interface PendingWrite {
   id: string;
   storeId: string;
   shiftId: string;
-  collection: "transactions" | "expenses" | "walletRecharges";
+  collection:
+    | "transactions"
+    | "expenses"
+    | "walletRecharges"
+    | "shiftClose";
   payload: Record<string, unknown>;
   createdAt: number;
+  /** Stable expense doc id for offline receipt upload after sync */
+  expenseDocId?: string;
+  /** Stable transaction doc id for offline photo upload after sync */
+  transactionDocId?: string;
+  /** Failed flush attempts (skip after threshold) */
+  attempts?: number;
+}
+
+/** IndexedDB-only: attachment blob queued until Firestore write lands */
+export type PendingAttachmentKind = "expenseReceipt" | "transactionPhoto";
+
+export interface PendingAttachment {
+  kind: PendingAttachmentKind;
+  /** Expense id or transaction id matching expenseDocId / transactionDocId on PendingWrite */
+  targetDocId: string;
+  storeId: string;
+  shiftId: string;
+  fileName: string;
+  blob: Blob;
+}
+
+/** @deprecated Use PendingAttachment with kind expenseReceipt */
+export interface PendingReceipt {
+  expenseDocId: string;
+  storeId: string;
+  shiftId: string;
+  fileName: string;
+  blob: Blob;
 }

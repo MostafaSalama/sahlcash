@@ -7,14 +7,18 @@ import { AppShell } from "@/components/layout/app-shell";
 import { Skeleton } from "@/components/ui/skeleton";
 
 export default function DashboardLayout({ children }: { children: ReactNode }) {
-  const { status, profile, store } = useAuth();
+  const { status, storeId, profile, store } = useAuth();
   const router = useRouter();
 
   useEffect(() => {
     if (status === "unauthenticated") {
       router.replace("/login");
+      return;
     }
-  }, [status, router]);
+    if (status === "authenticated" && !storeId) {
+      router.replace("/register");
+    }
+  }, [status, storeId, router]);
 
   if (status === "loading" || !profile || !store) {
     return (

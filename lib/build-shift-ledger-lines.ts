@@ -15,6 +15,9 @@ export function buildShiftLedgerLines(
     `Transactions: ${s.summary?.transactionCount ?? 0}`,
     `Wallet recharges: ${s.summary?.rechargeCount ?? 0}`,
   ];
+  if (s.handoverNote?.trim()) {
+    lines.push(`Handover: ${s.handoverNote.trim()}`);
+  }
   const opening = s.openingBalances ?? {};
   if (Object.keys(opening).length) {
     lines.push("Opening balances:");

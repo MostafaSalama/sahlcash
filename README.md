@@ -56,7 +56,11 @@ Web app for retail shops to run **shifts**, track **wallets** (cash, POS, e-wall
 ## Deploy (production)
 
 - **App**: Connect the repo to [Vercel](https://vercel.com) (or any Next.js host) and set the same `NEXT_PUBLIC_*` variables in the project settings.
-- **Backend**: After changing `firestore.rules`, `firestore.indexes.json`, or `storage.rules`, redeploy with Firebase CLI as above.
+- **Backend**: After changing `firestore.rules`, `firestore.indexes.json`, or `storage.rules`, redeploy with Firebase CLI as above (`firebase deploy --only firestore:rules,storage` covers transaction/expense photo paths).
+
+### Offline queue (Dexie)
+
+IndexedDB database `sahlCashDB` may upgrade to **version 3**: pending receipt blobs are migrated from `pendingReceipts` to `pendingAttachments` (same data; supports offline **transaction** photos as well as expense receipts). Existing queued writes on disk are preserved during upgrade.
 
 ## Project layout (high level)
 

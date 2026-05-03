@@ -1,19 +1,25 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { useParams } from "next/navigation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useParams, usePathname, useSearchParams } from "next/navigation";
 import { useTranslations, useLocale } from "next-intl";
 import {
   collection,
   doc,
   getDoc,
   getDocs,
+  limit,
   orderBy,
   query,
+  serverTimestamp,
+  startAfter,
+  Timestamp,
+  updateDoc,
   where,
+  type QueryDocumentSnapshot,
 } from "firebase/firestore";
-import { Timestamp } from "firebase/firestore";
-import { Link } from "@/i18n/navigation";
+import { toast } from "sonner";
+import { Link, useRouter } from "@/i18n/navigation";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -32,18 +38,24 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Skeleton } from "@/components/ui/skeleton";
+import { AttachmentThumbnail } from "@/components/shift/attachment-thumbnail";
 import { useAuth } from "@/contexts/auth-context";
 import { getDb } from "@/lib/firebase/client";
 import { buildShiftLedgerLines } from "@/lib/build-shift-ledger-lines";
 import { downloadShiftLedgerPdf } from "@/lib/pdf-shift-report";
-import { formatMoney } from "@/lib/utils";
+import { downloadCsv } from "@/lib/csv";
+import { cn, formatMoney } from "@/lib/utils";
 import type {
+  CorrectionDoc,
   ExpenseDoc,
   ShiftDoc,
   TransactionDoc,
   WalletDoc,
   WalletRechargeDoc,
 } from "@/types/firestore";
+
+const PAGE_SIZE = 50;
 
 function fmtDate(ts: Timestamp | undefined, locale: string) {
   if (!ts?.toDate) return "—";
@@ -52,13 +64,17 @@ function fmtDate(ts: Timestamp | undefined, locale: string) {
 
 export default function ShiftDetailPage() {
   const params = useParams();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const printMode = searchParams.get("print") === "1";
   const shiftId = typeof params.shiftId === "string" ? params.shiftId : "";
   const t = useTranslations("shift");
   const td = useTranslations("shift.detail");
   const tc = useTranslations("common");
   const locale = useLocale();
   const moneyLocale = locale === "ar" ? "ar-EG" : "en-US";
-  const { storeId, store } = useAuth();
+  const { storeId, store, profile, user } = useAuth();
 
   const [loading, setLoading] = useState(true);
   const [shift, setShift] = useState<(ShiftDoc & { id: string }) | null>(null);
@@ -72,6 +88,121 @@ export default function ShiftDetailPage() {
   const [recharges, setRecharges] = useState<
     (WalletRechargeDoc & { id: string })[]
   >([]);
+  const [corrections, setCorrections] = useState<
+    (CorrectionDoc & { id: string })[]
+  >([]);
+
+  const [lastTx, setLastTx] = useState<QueryDocumentSnapshot | null>(null);
+  const [lastEx, setLastEx] = useState<QueryDocumentSnapshot | null>(null);
+  const [txHasMore, setTxHasMore] = useState(false);
+  const [exHasMore, setExHasMore] = useState(false);
+  const [loadingMoreTx, setLoadingMoreTx] = useState(false);
+  const [loadingMoreEx, setLoadingMoreEx] = useState(false);
+
+  const reloadShiftData = useCallback(async () => {
+    if (!storeId || !shiftId) return;
+    const db = getDb();
+    const shiftRef = doc(db, "stores", storeId, "shifts", shiftId);
+    const txCol = collection(
+      db,
+      "stores",
+      storeId,
+      "shifts",
+      shiftId,
+      "transactions"
+    );
+    const exCol = collection(
+      db,
+      "stores",
+      storeId,
+      "shifts",
+      shiftId,
+      "expenses"
+    );
+
+    const txQ = query(txCol, orderBy("createdAt", "desc"), limit(PAGE_SIZE));
+    const exQ = query(exCol, orderBy("createdAt", "desc"), limit(PAGE_SIZE));
+    const corrQ = query(
+      collection(db, "stores", storeId, "corrections"),
+      where("shiftId", "==", shiftId),
+      orderBy("createdAt", "desc"),
+      limit(100)
+    );
+
+    const [shiftSnap, walletsSnap, txSnap, exSnap, rechargeSnap, corrSnap] =
+      await Promise.all([
+        getDoc(shiftRef),
+        getDocs(collection(db, "stores", storeId, "wallets")),
+        getDocs(txQ),
+        getDocs(exQ),
+        getDocs(
+          query(
+            collection(db, "stores", storeId, "walletRecharges"),
+            where("shiftId", "==", shiftId)
+          )
+        ),
+        getDocs(corrQ),
+      ]);
+
+    if (!shiftSnap.exists()) {
+      setShift(null);
+      setWallets([]);
+      setTransactions([]);
+      setExpenses([]);
+      setRecharges([]);
+      setCorrections([]);
+      setLastTx(null);
+      setLastEx(null);
+      setTxHasMore(false);
+      setExHasMore(false);
+      return;
+    }
+
+    setShift({ id: shiftSnap.id, ...(shiftSnap.data() as ShiftDoc) });
+    setWallets(
+      walletsSnap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as WalletDoc),
+      }))
+    );
+    setTransactions(
+      txSnap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as TransactionDoc),
+      }))
+    );
+    setLastTx(txSnap.docs.length ? txSnap.docs[txSnap.docs.length - 1]! : null);
+    setTxHasMore(txSnap.docs.length === PAGE_SIZE);
+
+    setExpenses(
+      exSnap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as ExpenseDoc),
+      }))
+    );
+    setLastEx(exSnap.docs.length ? exSnap.docs[exSnap.docs.length - 1]! : null);
+    setExHasMore(exSnap.docs.length === PAGE_SIZE);
+
+    const rechRows = rechargeSnap.docs.map((d) => ({
+      id: d.id,
+      ...(d.data() as WalletRechargeDoc),
+    }));
+    rechRows.sort((a, b) => {
+      const ta =
+        a.createdAt instanceof Timestamp ? a.createdAt.toMillis() : 0;
+      const tb =
+        b.createdAt instanceof Timestamp ? b.createdAt.toMillis() : 0;
+      return tb - ta;
+    });
+    setRecharges(rechRows);
+
+    setCorrections(
+      corrSnap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as CorrectionDoc),
+      }))
+    );
+  }, [storeId, shiftId]);
 
   useEffect(() => {
     if (!storeId || !shiftId) return;
@@ -79,91 +210,10 @@ export default function ShiftDetailPage() {
     (async () => {
       setLoading(true);
       try {
-        const db = getDb();
-        const [shiftSnap, walletsSnap, txSnap, exSnap, rechargeSnap] =
-          await Promise.all([
-            getDoc(doc(db, "stores", storeId, "shifts", shiftId)),
-            getDocs(collection(db, "stores", storeId, "wallets")),
-            getDocs(
-              query(
-                collection(
-                  db,
-                  "stores",
-                  storeId,
-                  "shifts",
-                  shiftId,
-                  "transactions"
-                ),
-                orderBy("createdAt", "desc")
-              )
-            ),
-            getDocs(
-              query(
-                collection(
-                  db,
-                  "stores",
-                  storeId,
-                  "shifts",
-                  shiftId,
-                  "expenses"
-                ),
-                orderBy("createdAt", "desc")
-              )
-            ),
-            getDocs(
-              query(
-                collection(db, "stores", storeId, "walletRecharges"),
-                where("shiftId", "==", shiftId)
-              )
-            ),
-          ]);
-
-        if (cancelled) return;
-
-        if (!shiftSnap.exists()) {
-          setShift(null);
-          setWallets([]);
-          setTransactions([]);
-          setExpenses([]);
-          setRecharges([]);
-          return;
-        }
-
-        setShift({ id: shiftSnap.id, ...(shiftSnap.data() as ShiftDoc) });
-        setWallets(
-          walletsSnap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as WalletDoc),
-          }))
-        );
-        setTransactions(
-          txSnap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as TransactionDoc),
-          }))
-        );
-        setExpenses(
-          exSnap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as ExpenseDoc),
-          }))
-        );
-        const rechRows = rechargeSnap.docs.map((d) => ({
-          id: d.id,
-          ...(d.data() as WalletRechargeDoc),
-        }));
-        rechRows.sort((a, b) => {
-          const ta =
-            a.createdAt instanceof Timestamp
-              ? a.createdAt.toMillis()
-              : 0;
-          const tb =
-            b.createdAt instanceof Timestamp
-              ? b.createdAt.toMillis()
-              : 0;
-          return tb - ta;
-        });
-        setRecharges(rechRows);
+        await reloadShiftData();
+      } catch (e) {
+        console.error(e);
+        toast.error(tc("error"));
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -171,9 +221,36 @@ export default function ShiftDetailPage() {
     return () => {
       cancelled = true;
     };
-  }, [storeId, shiftId]);
+  }, [storeId, shiftId, reloadShiftData, tc]);
+
+  const printOnceRef = useRef(false);
+  useEffect(() => {
+    if (!printMode) printOnceRef.current = false;
+  }, [printMode]);
+  useEffect(() => {
+    if (!printMode || loading || !shift || printOnceRef.current) return;
+    printOnceRef.current = true;
+    const id = window.setTimeout(() => window.print(), 400);
+    return () => clearTimeout(id);
+  }, [printMode, loading, shift]);
 
   const currency = store?.currency ?? "EGP";
+
+  const txPhotoGallery = useMemo(
+    () =>
+      transactions
+        .map((x) => x.photoUrl)
+        .filter((u): u is string => Boolean(u)),
+    [transactions]
+  );
+
+  const expenseReceiptGallery = useMemo(
+    () =>
+      expenses
+        .map((x) => x.receiptUrl)
+        .filter((u): u is string => Boolean(u)),
+    [expenses]
+  );
 
   const walletLabel = useMemo(() => {
     return (id: string) => {
@@ -183,15 +260,152 @@ export default function ShiftDetailPage() {
     };
   }, [wallets, locale]);
 
-  function downloadPdf() {
+  async function downloadPdf() {
     if (!shift) return;
-    const fmt = (n: number) => formatMoney(n, currency, moneyLocale);
-    const lines = buildShiftLedgerLines(shift, walletLabel, fmt);
-    downloadShiftLedgerPdf({
-      title: `SahlCash shift ${shift.id}`,
-      locale,
-      lines,
-    });
+    try {
+      const fmt = (n: number) => formatMoney(n, currency, moneyLocale);
+      const lines = buildShiftLedgerLines(shift, walletLabel, fmt);
+      await downloadShiftLedgerPdf({
+        title: `SahlCash shift ${shift.id}`,
+        locale,
+        lines,
+      });
+    } catch (e) {
+      console.error(e);
+      toast.error(tc("error"));
+    }
+  }
+
+  function exportDetailCsv() {
+    if (!shift) return;
+    const rows: (string | number)[][] = [];
+    rows.push([`shift_${shift.id}`]);
+    rows.push([]);
+    rows.push(["transactions"]);
+    rows.push(["id", "time", "type", "wallet", "amount", "fee", "photoUrl"]);
+    for (const tx of transactions) {
+      const ts =
+        tx.createdAt instanceof Timestamp
+          ? tx.createdAt.toDate().toISOString()
+          : "";
+      rows.push([
+        tx.id,
+        ts,
+        tx.type,
+        walletLabel(tx.walletId),
+        tx.amount,
+        tx.fee,
+        tx.photoUrl ?? "",
+      ]);
+    }
+    rows.push([]);
+    rows.push(["expenses"]);
+    rows.push(["id", "time", "category", "amount", "note", "receiptUrl"]);
+    for (const ex of expenses) {
+      const ts =
+        ex.createdAt instanceof Timestamp
+          ? ex.createdAt.toDate().toISOString()
+          : "";
+      rows.push([
+        ex.id,
+        ts,
+        ex.category,
+        ex.amount,
+        ex.note ?? "",
+        ex.receiptUrl ?? "",
+      ]);
+    }
+    downloadCsv(`shift-${shift.id}-detail.csv`, rows);
+  }
+
+  async function loadMoreTx() {
+    if (!storeId || !shiftId || !lastTx || loadingMoreTx) return;
+    setLoadingMoreTx(true);
+    try {
+      const db = getDb();
+      const txCol = collection(
+        db,
+        "stores",
+        storeId,
+        "shifts",
+        shiftId,
+        "transactions"
+      );
+      const txQ = query(
+        txCol,
+        orderBy("createdAt", "desc"),
+        startAfter(lastTx),
+        limit(PAGE_SIZE)
+      );
+      const snap = await getDocs(txQ);
+      const next = snap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as TransactionDoc),
+      }));
+      setTransactions((prev) => [...prev, ...next]);
+      setLastTx(snap.docs.length ? snap.docs[snap.docs.length - 1]! : lastTx);
+      setTxHasMore(snap.docs.length === PAGE_SIZE);
+    } catch (e) {
+      console.error(e);
+      toast.error(tc("error"));
+    } finally {
+      setLoadingMoreTx(false);
+    }
+  }
+
+  async function loadMoreEx() {
+    if (!storeId || !shiftId || !lastEx || loadingMoreEx) return;
+    setLoadingMoreEx(true);
+    try {
+      const db = getDb();
+      const exCol = collection(
+        db,
+        "stores",
+        storeId,
+        "shifts",
+        shiftId,
+        "expenses"
+      );
+      const exQ = query(
+        exCol,
+        orderBy("createdAt", "desc"),
+        startAfter(lastEx),
+        limit(PAGE_SIZE)
+      );
+      const snap = await getDocs(exQ);
+      const next = snap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as ExpenseDoc),
+      }));
+      setExpenses((prev) => [...prev, ...next]);
+      setLastEx(snap.docs.length ? snap.docs[snap.docs.length - 1]! : lastEx);
+      setExHasMore(snap.docs.length === PAGE_SIZE);
+    } catch (e) {
+      console.error(e);
+      toast.error(tc("error"));
+    } finally {
+      setLoadingMoreEx(false);
+    }
+  }
+
+  async function markReconciled() {
+    if (!storeId || !shift || !user || profile?.role !== "admin") return;
+    try {
+      const db = getDb();
+      await updateDoc(doc(db, "stores", storeId, "shifts", shift.id), {
+        reconciledAt: serverTimestamp(),
+        reconciledBy: user.uid,
+      });
+      setShift({
+        ...shift,
+        reconciledBy: user.uid,
+        reconciledAt: Timestamp.now(),
+      });
+      toast.success(tc("save"));
+    } catch (e) {
+      console.error(e);
+      toast.error(tc("error"));
+    }
   }
 
   const balanceRows = useMemo(() => {
@@ -223,15 +437,41 @@ export default function ShiftDetailPage() {
           <p className="font-mono text-sm text-muted-foreground">{shiftId}</p>
         </div>
         {shift?.status === "closed" ? (
-          <Button type="button" variant="outline" onClick={() => downloadPdf()}>
-            {td("downloadPdf")}
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button type="button" variant="outline" onClick={() => void downloadPdf()}>
+              {td("downloadPdf")}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() =>
+                router.push(`${pathname}?print=1`)
+              }
+            >
+              {tc("print")}
+            </Button>
+            <Button type="button" variant="outline" onClick={exportDetailCsv}>
+              {td("exportCsv")}
+            </Button>
+            {profile?.role === "admin" &&
+            shift &&
+            !shift.reconciledAt &&
+            shift.status === "closed" ? (
+              <Button type="button" onClick={() => void markReconciled()}>
+                {td("markReconciled")}
+              </Button>
+            ) : null}
+          </div>
         ) : null}
       </div>
 
       {loading ? (
         <Card>
-          <CardContent className="py-10">{tc("loading")}</CardContent>
+          <CardContent className="space-y-3 py-10">
+            <Skeleton className="h-8 w-full max-w-md" />
+            <Skeleton className="h-32 w-full" />
+            <Skeleton className="h-48 w-full" />
+          </CardContent>
         </Card>
       ) : !shift ? (
         <Card>
@@ -245,15 +485,27 @@ export default function ShiftDetailPage() {
       ) : (
         <>
           <div className="flex flex-wrap items-center gap-2">
-            <Badge
-              variant={shift.status === "open" ? "warning" : "secondary"}
-            >
+            <Badge variant={shift.status === "open" ? "warning" : "secondary"}>
               {shift.status === "open" ? tc("open") : tc("closed")}
             </Badge>
+            {shift.reconciledAt ? (
+              <Badge variant="success">{td("reconciled")}</Badge>
+            ) : null}
             <span className="text-sm text-muted-foreground">
               {shift.cashierEmail ?? shift.cashierId}
             </span>
           </div>
+
+          {shift.handoverNote?.trim() ? (
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-base">{td("handoverTitle")}</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <p className="whitespace-pre-wrap text-sm">{shift.handoverNote.trim()}</p>
+              </CardContent>
+            </Card>
+          ) : null}
 
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <Card>
@@ -335,6 +587,87 @@ export default function ShiftDetailPage() {
           {balanceRows.length > 0 ? (
             <Card>
               <CardHeader>
+                <CardTitle>{td("netWalletCardTitle")}</CardTitle>
+                <CardDescription>{td("netWalletCardHint")}</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {balanceRows.map((wid) => {
+                  const open = shift.openingBalances?.[wid] ?? 0;
+                  const exp = shift.expectedBalances?.[wid];
+                  const decl = shift.declaredBalances?.[wid];
+                  const disc = shift.discrepancies?.[wid];
+                  const tot =
+                    Math.abs(open) +
+                      Math.abs(exp ?? 0) +
+                      Math.abs(decl ?? 0) ||
+                    1;
+                  const discNum = disc ?? 0;
+                  return (
+                    <div key={wid} className="space-y-2 border-b pb-4 last:border-0">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="font-medium">{walletLabel(wid)}</span>
+                        {shift.discrepancies && disc !== undefined ? (
+                          Math.abs(discNum) > 1e-9 ? (
+                            <Badge variant="destructive">
+                              {td("disc")}{" "}
+                              {formatMoney(discNum, currency, moneyLocale)}
+                            </Badge>
+                          ) : (
+                            <Badge variant="secondary">OK</Badge>
+                          )
+                        ) : null}
+                      </div>
+                      <div className="flex h-2.5 w-full max-w-xl overflow-hidden rounded-full bg-muted">
+                        <div
+                          className="bg-sky-500/90"
+                          style={{
+                            width: `${(Math.abs(open) / tot) * 100}%`,
+                          }}
+                          title={`${td("opening")}`}
+                        />
+                        <div
+                          className="bg-emerald-500/90"
+                          style={{
+                            width: `${(Math.abs(exp ?? 0) / tot) * 100}%`,
+                          }}
+                          title={`${td("expected")}`}
+                        />
+                        <div
+                          className="bg-amber-500/90"
+                          style={{
+                            width: `${(Math.abs(decl ?? 0) / tot) * 100}%`,
+                          }}
+                          title={`${td("declared")}`}
+                        />
+                      </div>
+                      <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                        <span>
+                          {td("opening")}:{" "}
+                          {formatMoney(open, currency, moneyLocale)}
+                        </span>
+                        <span>
+                          {td("expected")}:{" "}
+                          {exp != null
+                            ? formatMoney(exp, currency, moneyLocale)
+                            : "—"}
+                        </span>
+                        <span>
+                          {td("declared")}:{" "}
+                          {decl != null
+                            ? formatMoney(decl, currency, moneyLocale)
+                            : "—"}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </CardContent>
+            </Card>
+          ) : null}
+
+          {balanceRows.length > 0 ? (
+            <Card>
+              <CardHeader>
                 <CardTitle>{td("balancesTitle")}</CardTitle>
                 <CardDescription>{td("balancesHint")}</CardDescription>
               </CardHeader>
@@ -396,8 +729,16 @@ export default function ShiftDetailPage() {
             </Card>
           ) : null}
 
-          <Tabs defaultValue="transactions">
-            <TabsList>
+          <Tabs
+            defaultValue="transactions"
+            className={printMode ? "shift-detail-print-tabs" : undefined}
+          >
+            <TabsList
+              className={cn(
+                "flex flex-wrap h-auto gap-1",
+                printMode && "hidden"
+              )}
+            >
               <TabsTrigger value="transactions">
                 {td("tabTransactions")} ({transactions.length})
               </TabsTrigger>
@@ -407,16 +748,27 @@ export default function ShiftDetailPage() {
               <TabsTrigger value="recharges">
                 {td("tabRecharges")} ({recharges.length})
               </TabsTrigger>
+              <TabsTrigger value="corrections">
+                {td("tabCorrections")} ({corrections.length})
+              </TabsTrigger>
             </TabsList>
-            <TabsContent value="transactions" className="mt-4">
+            <TabsContent
+              value="transactions"
+              forceMount
+              className={cn(
+                "mt-4",
+                printMode ? "block" : "data-[state=inactive]:hidden"
+              )}
+            >
               <Card>
-                <CardContent className="pt-6">
+                <CardContent className="space-y-4 pt-6">
                   {transactions.length === 0 ? (
                     <p className="text-muted-foreground">{tc("noData")}</p>
                   ) : (
                     <Table>
                       <TableHeader>
                         <TableRow>
+                          <TableHead className="w-14">{t("photoCol")}</TableHead>
                           <TableHead>{td("time")}</TableHead>
                           <TableHead>{t("transactionType")}</TableHead>
                           <TableHead>{t("wallet")}</TableHead>
@@ -427,6 +779,22 @@ export default function ShiftDetailPage() {
                       <TableBody>
                         {transactions.map((tx) => (
                           <TableRow key={tx.id}>
+                            <TableCell>
+                              <AttachmentThumbnail
+                                urls={tx.photoUrl ? [tx.photoUrl] : []}
+                                lightboxUrls={
+                                  txPhotoGallery.length ? txPhotoGallery : undefined
+                                }
+                                lightboxIndex={
+                                  tx.photoUrl
+                                    ? txPhotoGallery.indexOf(tx.photoUrl)
+                                    : 0
+                                }
+                                title={t("transactionPhoto")}
+                                prevLabel={t("prevAttachment")}
+                                nextLabel={t("nextAttachment")}
+                              />
+                            </TableCell>
                             <TableCell className="whitespace-nowrap text-sm">
                               {fmtDate(tx.createdAt as Timestamp, locale)}
                             </TableCell>
@@ -443,18 +811,36 @@ export default function ShiftDetailPage() {
                       </TableBody>
                     </Table>
                   )}
+                  {txHasMore ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={loadingMoreTx}
+                      onClick={() => void loadMoreTx()}
+                    >
+                      {td("loadMore")}
+                    </Button>
+                  ) : null}
                 </CardContent>
               </Card>
             </TabsContent>
-            <TabsContent value="expenses" className="mt-4">
+            <TabsContent
+              value="expenses"
+              forceMount
+              className={cn(
+                "mt-4",
+                printMode ? "block" : "data-[state=inactive]:hidden"
+              )}
+            >
               <Card>
-                <CardContent className="pt-6">
+                <CardContent className="space-y-4 pt-6">
                   {expenses.length === 0 ? (
                     <p className="text-muted-foreground">{tc("noData")}</p>
                   ) : (
                     <Table>
                       <TableHeader>
                         <TableRow>
+                          <TableHead>{td("receipt")}</TableHead>
                           <TableHead>{td("time")}</TableHead>
                           <TableHead>{td("category")}</TableHead>
                           <TableHead className="text-end">{td("amount")}</TableHead>
@@ -464,6 +850,24 @@ export default function ShiftDetailPage() {
                       <TableBody>
                         {expenses.map((ex) => (
                           <TableRow key={ex.id}>
+                            <TableCell>
+                              <AttachmentThumbnail
+                                urls={ex.receiptUrl ? [ex.receiptUrl] : []}
+                                lightboxUrls={
+                                  expenseReceiptGallery.length
+                                    ? expenseReceiptGallery
+                                    : undefined
+                                }
+                                lightboxIndex={
+                                  ex.receiptUrl
+                                    ? expenseReceiptGallery.indexOf(ex.receiptUrl)
+                                    : 0
+                                }
+                                title={t("receiptUpload")}
+                                prevLabel={t("prevAttachment")}
+                                nextLabel={t("nextAttachment")}
+                              />
+                            </TableCell>
                             <TableCell className="whitespace-nowrap text-sm">
                               {fmtDate(ex.createdAt as Timestamp, locale)}
                             </TableCell>
@@ -485,10 +889,27 @@ export default function ShiftDetailPage() {
                       </TableBody>
                     </Table>
                   )}
+                  {exHasMore ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={loadingMoreEx}
+                      onClick={() => void loadMoreEx()}
+                    >
+                      {td("loadMore")}
+                    </Button>
+                  ) : null}
                 </CardContent>
               </Card>
             </TabsContent>
-            <TabsContent value="recharges" className="mt-4">
+            <TabsContent
+              value="recharges"
+              forceMount
+              className={cn(
+                "mt-4",
+                printMode ? "block" : "data-[state=inactive]:hidden"
+              )}
+            >
               <Card>
                 <CardContent className="pt-6">
                   {recharges.length === 0 ? (
@@ -515,6 +936,55 @@ export default function ShiftDetailPage() {
                             </TableCell>
                             <TableCell className="text-end font-mono text-sm">
                               {formatMoney(r.amount, currency, moneyLocale)}
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  )}
+                </CardContent>
+              </Card>
+            </TabsContent>
+            <TabsContent
+              value="corrections"
+              forceMount
+              className={cn(
+                "mt-4",
+                printMode ? "block" : "data-[state=inactive]:hidden"
+              )}
+            >
+              <Card>
+                <CardContent className="pt-6">
+                  {corrections.length === 0 ? (
+                    <p className="text-muted-foreground">{tc("noData")}</p>
+                  ) : (
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>{td("time")}</TableHead>
+                          <TableHead>{td("correctionAmount")}</TableHead>
+                          <TableHead>{td("correctionWallet")}</TableHead>
+                          <TableHead>{td("correctionReason")}</TableHead>
+                          <TableHead>{td("correctionAdmin")}</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {corrections.map((c) => (
+                          <TableRow key={c.id}>
+                            <TableCell className="whitespace-nowrap text-sm">
+                              {fmtDate(c.createdAt as Timestamp, locale)}
+                            </TableCell>
+                            <TableCell className="font-mono text-sm">
+                              {formatMoney(c.amount, currency, moneyLocale)}
+                            </TableCell>
+                            <TableCell>
+                              {c.walletId ? walletLabel(c.walletId) : "—"}
+                            </TableCell>
+                            <TableCell className="max-w-xs text-sm">
+                              {c.reason}
+                            </TableCell>
+                            <TableCell className="font-mono text-xs text-muted-foreground">
+                              {c.adminId}
                             </TableCell>
                           </TableRow>
                         ))}
